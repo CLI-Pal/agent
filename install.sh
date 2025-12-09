@@ -3,7 +3,7 @@ set -e
 
 # CLI Pal Agent Installation Script
 # Usage: 
-#   Install:   curl -sSL https://clipal.me/install.sh | sudo bash -s -- --token=YOUR_TOKEN [--server=wss://your-server.com/ws] [--mysql-root-password=PASSWORD] [--enable-performance-schema]
+#   Install:   curl -sSL https://clipal.me/install.sh | sudo bash -s -- --token=YOUR_TOKEN [--mysql-root-password=PASSWORD] [--enable-performance-schema]
 #   Uninstall: curl -sSL https://clipal.me/install.sh | sudo bash -s -- uninstall
 
 INSTALL_DIR="/opt/clipal"
@@ -137,6 +137,10 @@ while [[ $# -gt 0 ]]; do
             ENABLE_PERFORMANCE_SCHEMA="true"
             shift
             ;;
+        --dev)
+            INSTALL_DEV="true"
+            shift
+            ;;
         uninstall)
             # Already handled above
             shift
@@ -150,7 +154,7 @@ done
 # Validate token (only needed for installation, not uninstall)
 if [ -z "$TOKEN" ]; then
     log_error "Token is required!"
-    echo "Usage: $0 --token=YOUR_TOKEN [--server=wss://your-server.com/ws]"
+    echo "Usage: $0 --token=YOUR_TOKEN [--server=wss://your-server.com/ws] [--dev]"
     exit 1
 fi
 
@@ -257,13 +261,19 @@ if [ -n "$MYSQL_ROOT_PASSWORD" ]; then
         chmod 600 "$MYSQL_ROOT_CNF"
         
         # Build config with socket if found
-        cat > "$MYSQL_ROOT_CNF" <<ROOTCNF
-[client]
-user=root
-password=$MYSQL_ROOT_PASSWORD
-host=$MYSQL_HOST
-port=$MYSQL_PORT
-ROOTCNF
+        echo "[client]" > "$MYSQL_ROOT_CNF"
+        echo "user=root" >> "$MYSQL_ROOT_CNF"
+
+        # Safe password handling:
+        # 1. Escape backslashes first (replace \ with \\)
+        # 2. Escape double quotes (replace " with \")
+        # 3. Write as quoted string: password="..."
+        ESCAPED_PWD="${MYSQL_ROOT_PASSWORD//\\/\\\\}"
+        ESCAPED_PWD="${ESCAPED_PWD//\"/\\\"}"
+        echo "password=\"$ESCAPED_PWD\"" >> "$MYSQL_ROOT_CNF"
+
+        echo "host=$MYSQL_HOST" >> "$MYSQL_ROOT_CNF"
+        echo "port=$MYSQL_PORT" >> "$MYSQL_ROOT_CNF"
         
         # Add socket path if we found it (only for localhost connections)
         if [ -n "$MYSQL_SOCKET" ] && [ "$MYSQL_HOST" = "localhost" ]; then
@@ -576,19 +586,31 @@ fi
 log_info "Creating installation directory..."
 mkdir -p "$INSTALL_DIR"
 
-# Download agent (for now, we'll copy it, but in production this would download from your server)
 log_info "Installing agent..."
 
-# Download the agent from your server
-# Download the agent from the official GitHub repository
-GITHUB_ORG="CLI-Pal"
-GITHUB_REPO="agent"
-BRANCH="${BRANCH:-main}"
-AGENT_URL="https://raw.githubusercontent.com/$GITHUB_ORG/$GITHUB_REPO/$BRANCH/agent.py"
+# Download source selection
+DOMAIN="${INSTALL_SERVER:-clipal.me}"
 
-# Allow overriding URL for testing/development
+if [ "$INSTALL_DEV" = "true" ]; then
+    log_warn "Using DEV mode - Downloading agent from $DOMAIN/downloads/agent.py"
+    AGENT_URL="https://$DOMAIN/downloads/agent.py"
+else
+    # Default: Download from official GitHub repo
+    GITHUB_ORG="CLI-Pal"
+    GITHUB_REPO="agent"
+    BRANCH="${BRANCH:-main}"
+    AGENT_URL="https://raw.githubusercontent.com/$GITHUB_ORG/$GITHUB_REPO/$BRANCH/agent.py"
+fi
+
+# Allow overriding URL for testing/development via env var
 if [ -n "$CUSTOM_AGENT_URL" ]; then
     AGENT_URL="$CUSTOM_AGENT_URL"
+fi
+
+# Enforce HTTPS-only downloads for security
+if [[ "$AGENT_URL" == http://* ]]; then
+    log_error "HTTPS is required for security. HTTP downloads are not allowed."
+    exit 1
 fi
 
 log_info "Downloading agent from $AGENT_URL..."
