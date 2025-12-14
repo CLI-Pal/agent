@@ -39,7 +39,7 @@ except ImportError:
 
 import urllib.request
 
-VERSION = "0.0.3"
+VERSION = "0.0.4"
 
 # Configuration file path
 CONFIG_FILE = "/opt/clipal/clipal.conf"
@@ -97,6 +97,7 @@ class MySQLMonitor:
     
     Phase 1: Collects ALL SHOW GLOBAL STATUS and SHOW GLOBAL VARIABLES
     Phase 2: Collects query stats from performance_schema
+    Phase 3: Deadlock detection and parsing
     """
     
     def __init__(self, host: str = 'localhost', port: int = 3306, user: str = None, password: str = None, debug: bool = False, slow_threshold_ms: int = 200):
@@ -113,6 +114,10 @@ class MySQLMonitor:
         
         # Track collection cycles for query stats (Phase 2 - every 5 minutes)
         self.metrics_count = 0
+        
+        # Deadlock tracking (Phase 3)
+        self.last_deadlock_count = None  # Track Innodb_deadlocks counter
+        self.last_deadlock_hash = None   # Prevent duplicate submissions
     
     def log(self, message: str, always: bool = False) -> None:
         """Log with timestamp
@@ -260,6 +265,16 @@ class MySQLMonitor:
             cursor.close()
             self.log(f"Collected metrics: {len(metrics)} items + full status ({len(status)} vars)")
             
+            # ==========================================
+            # PHASE 3: Check for new deadlocks
+            # ==========================================
+            try:
+                deadlock_info = self.check_for_deadlock(status)
+                if deadlock_info:
+                    metrics['deadlock'] = deadlock_info
+            except Exception as e:
+                self.log(f"Error checking for deadlocks: {type(e).__name__}: {e}", always=True)
+            
         except mysql.connector.Error as e:
             self.log(f"MySQL error: {e.msg} (Error {e.errno})", always=True)
         except Exception as e:
@@ -405,6 +420,401 @@ class MySQLMonitor:
             self.log(f"Error collecting query stats: {type(e).__name__}: {e}", always=True)
             return []
 
+    # ==========================================================================
+    # PHASE 3: Deadlock Detection and Parsing
+    # ==========================================================================
+    
+    def check_for_deadlock(self, current_status: dict) -> dict:
+        """Check if a new deadlock occurred by comparing Innodb_deadlocks counter
+        
+        Args:
+            current_status: Dict from SHOW GLOBAL STATUS
+            
+        Returns:
+            Parsed deadlock info dict if new deadlock detected, None otherwise
+        """
+        current_count = int(current_status.get('Innodb_deadlocks', 0))
+        
+        # First run - just store the baseline
+        if self.last_deadlock_count is None:
+            self.last_deadlock_count = current_count
+            self.log(f"Deadlock monitoring initialized (baseline count: {current_count})")
+            return None
+        
+        # No new deadlock
+        if current_count <= self.last_deadlock_count:
+            return None
+        
+        # NEW DEADLOCK DETECTED!
+        deadlocks_since_last = current_count - self.last_deadlock_count
+        self.log(f"🔴 Deadlock detected! Counter: {self.last_deadlock_count} → {current_count} (+{deadlocks_since_last})", always=True)
+        self.last_deadlock_count = current_count
+        
+        # Fetch and parse SHOW ENGINE INNODB STATUS
+        return self.get_deadlock_info()
+    
+    def get_deadlock_info(self) -> dict:
+        """Fetch SHOW ENGINE INNODB STATUS and parse the LATEST DETECTED DEADLOCK section
+        
+        Returns:
+            Dict with parsed deadlock info, or None if parsing fails
+        """
+        conn = self._connect()
+        if not conn:
+            self.log("Failed to connect to MySQL for deadlock info", always=True)
+            return None
+        
+        try:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SHOW ENGINE INNODB STATUS")
+            result = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            
+            if not result:
+                self.log("SHOW ENGINE INNODB STATUS returned no result", always=True)
+                return None
+            
+            # The output is in the 'Status' column
+            raw_status = result.get('Status', '')
+            
+            if not raw_status:
+                self.log("INNODB STATUS is empty", always=True)
+                return None
+            
+            return self.parse_deadlock_section(raw_status)
+            
+        except Exception as e:
+            self.log(f"Error fetching INNODB STATUS: {type(e).__name__}: {e}", always=True)
+            if conn and conn.is_connected():
+                conn.close()
+            return None
+    
+    def parse_deadlock_section(self, innodb_status: str) -> dict:
+        """Parse the LATEST DETECTED DEADLOCK section from INNODB STATUS
+        
+        Handles MySQL 5.7, 8.0, and MariaDB variations.
+        Fault-tolerant: returns partial data if parsing fails.
+        
+        Args:
+            innodb_status: Full output from SHOW ENGINE INNODB STATUS
+            
+        Returns:
+            Dict with deadlock info, or None if no deadlock section found
+        """
+        parse_errors = []
+        
+        # Extract the deadlock section
+        deadlock_section = self._extract_deadlock_section(innodb_status)
+        if not deadlock_section:
+            self.log("No LATEST DETECTED DEADLOCK section found in INNODB STATUS", always=True)
+            return None
+        
+        # Dedupe check - hash the raw section to avoid re-sending same deadlock
+        section_hash = hashlib.md5(deadlock_section.encode()).hexdigest()[:16]
+        if section_hash == self.last_deadlock_hash:
+            self.log("Deadlock already reported (same hash), skipping duplicate", always=True)
+            return None
+        self.last_deadlock_hash = section_hash
+        
+        # Parse transactions
+        transactions = self._parse_transactions(deadlock_section, parse_errors)
+        
+        # Generate fingerprint for grouping (normalized queries)
+        fingerprint = self._generate_query_fingerprint(transactions)
+        
+        # Extract tables involved
+        tables_involved = self._extract_tables_from_transactions(transactions)
+        
+        # Build locks summary
+        locks_summary = self._build_locks_summary(transactions)
+        
+        result = {
+            'detected_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'raw_deadlock_output': deadlock_section[:65536],  # 64KB cap
+            'section_hash': section_hash,
+            'query_pair_fingerprint': fingerprint,
+            'tables_involved': tables_involved,
+            'locks_summary': locks_summary,
+            'transactions': transactions,
+            'parse_errors': parse_errors if parse_errors else None
+        }
+        
+        # Log summary
+        tx_count = len(transactions)
+        query_preview = transactions[0].get('query', '')[:50] if transactions else 'N/A'
+        self.log(f"Parsed deadlock: {tx_count} transactions, fingerprint={fingerprint[:8]}..., tables={tables_involved}", always=True)
+        
+        return result
+    
+    def _extract_deadlock_section(self, innodb_status: str) -> str:
+        """Extract just the LATEST DETECTED DEADLOCK section
+        
+        Args:
+            innodb_status: Full INNODB STATUS output
+            
+        Returns:
+            The deadlock section text, or None if not found
+        """
+        # Multiple patterns to handle MySQL 5.7, 8.0, MariaDB variations
+        patterns = [
+            # Standard format with dashes
+            r'LATEST DETECTED DEADLOCK\n-+\n(.*?)(?=\n-{3,}\n[A-Z]|\nTRANSACTIONS\n|\Z)',
+            # Without dashes (some MariaDB versions)
+            r'LATEST DETECTED DEADLOCK\n(.*?)(?=\n[A-Z]{3,}[A-Z\s]+\n|\Z)',
+            # Fallback: capture until next major section
+            r'LATEST DETECTED DEADLOCK\n(.*?)(?=\nFILE I/O|\nLOG|\nROW OPERATIONS|\nINSERT BUFFER|\nBUFFER POOL|\Z)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, innodb_status, re.DOTALL | re.IGNORECASE)
+            if match:
+                section = match.group(1).strip()
+                if section and len(section) > 50:  # Sanity check - should have meaningful content
+                    return section
+        
+        return None
+    
+    def _parse_transactions(self, deadlock_section: str, parse_errors: list) -> list:
+        """Parse transaction details from deadlock section
+        
+        Args:
+            deadlock_section: The extracted deadlock section text
+            parse_errors: List to append any parse errors to
+            
+        Returns:
+            List of transaction dicts with: id, role, query, tables, lock_info
+        """
+        transactions = []
+        
+        # Split by transaction markers
+        # MySQL format: "*** (1) TRANSACTION:" or "*** (2) TRANSACTION:"
+        tx_pattern = r'\*\*\*\s*\((\d+)\)\s*TRANSACTION:'
+        tx_splits = re.split(tx_pattern, deadlock_section)
+        
+        # tx_splits = ['...header...', '1', '...tx1 content...', '2', '...tx2 content...']
+        for i in range(1, len(tx_splits), 2):
+            try:
+                tx_num = tx_splits[i]
+                tx_content = tx_splits[i + 1] if i + 1 < len(tx_splits) else ''
+                
+                tx_info = {
+                    'transaction_id': tx_num,
+                    'role': self._determine_role(tx_content),
+                    'query': self._extract_query(tx_content),
+                    'tables_locked': self._extract_locked_tables(tx_content),
+                    'lock_mode': self._extract_lock_mode(tx_content),
+                    'lock_type': self._extract_lock_type(tx_content),
+                    'waiting_for': self._extract_waiting_for(tx_content),
+                    'thread_id': self._extract_thread_id(tx_content),
+                }
+                transactions.append(tx_info)
+            except Exception as e:
+                parse_errors.append(f"Error parsing transaction {i}: {str(e)[:100]}")
+                self.log(f"Error parsing transaction: {e}", always=True)
+        
+        return transactions
+    
+    def _determine_role(self, tx_content: str) -> str:
+        """Determine if transaction is WAITING or HOLDING a lock"""
+        tx_upper = tx_content.upper()
+        
+        # Check for waiting indicators
+        if 'WAITING FOR THIS LOCK' in tx_upper:
+            return 'WAITING'
+        if 'LOCK WAIT' in tx_upper:
+            return 'WAITING'
+            
+        # Check for holding indicators
+        if 'HOLDS THE LOCK' in tx_upper:
+            return 'HOLDING'
+        
+        # Check victim status
+        if 'WE ROLL BACK' in tx_upper:
+            return 'VICTIM'
+        
+        return 'UNKNOWN'
+    
+    def _extract_query(self, tx_content: str) -> str:
+        """Extract the SQL query from transaction content
+        
+        The query appears after lock info, typically near the end of each transaction block.
+        """
+        # Common SQL keywords that start queries
+        sql_keywords = ['SELECT', 'UPDATE', 'DELETE', 'INSERT', 'REPLACE', 'CALL']
+        
+        lines = tx_content.split('\n')
+        query_lines = []
+        in_query = False
+        
+        for line in lines:
+            line_stripped = line.strip()
+            line_upper = line_stripped.upper()
+            
+            # Skip empty lines and InnoDB metadata
+            if not line_stripped:
+                if in_query:
+                    break  # End of query
+                continue
+            
+            # Skip InnoDB info lines
+            if any(skip in line_upper for skip in [
+                'MYSQL THREAD ID', 'TRANSACTION:', 'LOCK WAIT', 
+                'RECORD LOCKS', 'TABLE LOCK', 'HOLDS THE LOCK',
+                'WAITING FOR THIS LOCK', 'ACTIVE ', 'STARTING INDEX',
+                'SPACE ID', 'PAGE NO', 'N BITS', 'INDEX', 'TRX'
+            ]):
+                if in_query:
+                    break  # End of query (hit metadata)
+                continue
+            
+            # Check if this line starts a query
+            if any(line_upper.startswith(kw) for kw in sql_keywords):
+                in_query = True
+                query_lines.append(line_stripped)
+            elif in_query:
+                # Continue multi-line query
+                query_lines.append(line_stripped)
+        
+        query = ' '.join(query_lines)
+        
+        # Clean up common artifacts
+        query = re.sub(r'\s+', ' ', query).strip()
+        
+        return query
+    
+    def _extract_locked_tables(self, tx_content: str) -> list:
+        """Extract table names involved in locks"""
+        tables = set()
+        
+        # Pattern: table `schema`.`table` or table `table`
+        # MySQL INNODB STATUS format examples:
+        # - "TABLE LOCK table `db`.`tablename`"
+        # - "RECORD LOCKS space id 123 page no 456 n bits 789 index `idx` of table `db`.`tablename`"
+        table_patterns = [
+            r'table\s+`([^`]+)`\.`([^`]+)`',  # schema.table format
+            r'table\s+`([^`]+)`(?!\s*\.)',     # just table (no dot after)
+        ]
+        
+        for pattern in table_patterns:
+            for match in re.finditer(pattern, tx_content, re.IGNORECASE):
+                if match.lastindex == 2:
+                    # schema.table format
+                    tables.add(f"{match.group(1)}.{match.group(2)}")
+                else:
+                    # just table
+                    tables.add(match.group(1))
+        
+        return list(tables)
+    
+    def _extract_lock_mode(self, tx_content: str) -> str:
+        """Extract lock mode (X, S, IX, IS, etc.)"""
+        # Pattern: "lock mode X" or "lock_mode X" or "X lock"
+        patterns = [
+            r'lock[_\s]mode\s+(\w+)',
+            r'\b(X|S|IX|IS)\s+lock',
+            r'locks\s+(\w+)\s+lock',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, tx_content, re.IGNORECASE)
+            if match:
+                return match.group(1).upper()
+        
+        return ''
+    
+    def _extract_lock_type(self, tx_content: str) -> str:
+        """Extract lock type (TABLE LOCK, RECORD LOCK, etc.)"""
+        tx_upper = tx_content.upper()
+        
+        if 'RECORD LOCKS' in tx_upper or 'RECORD LOCK' in tx_upper:
+            return 'RECORD'
+        if 'TABLE LOCK' in tx_upper:
+            return 'TABLE'
+        if 'GAP' in tx_upper:
+            return 'GAP'
+        
+        return 'UNKNOWN'
+    
+    def _extract_waiting_for(self, tx_content: str) -> str:
+        """Extract what the transaction is waiting for"""
+        match = re.search(
+            r'WAITING FOR THIS LOCK TO BE GRANTED[:\s]*(.*?)(?=\n\*\*\*|\n[A-Z]{3,}[A-Z\s]+:|\Z)', 
+            tx_content, 
+            re.DOTALL | re.IGNORECASE
+        )
+        if match:
+            return match.group(1).strip()[:500]  # Cap at 500 chars
+        return ''
+    
+    def _extract_thread_id(self, tx_content: str) -> str:
+        """Extract MySQL thread ID"""
+        match = re.search(r'MySQL\s+thread\s+id\s+(\d+)', tx_content, re.IGNORECASE)
+        return match.group(1) if match else ''
+    
+    def _generate_query_fingerprint(self, transactions: list) -> str:
+        """Generate a fingerprint for grouping identical deadlock patterns
+        
+        Normalizes queries by stripping literals, then hashes the pair.
+        """
+        queries = []
+        for tx in transactions:
+            normalized = self._normalize_query_for_fingerprint(tx.get('query', ''))
+            queries.append(normalized)
+        
+        # Sort to ensure consistent fingerprint regardless of transaction order
+        queries.sort()
+        combined = '|||'.join(queries)
+        
+        return hashlib.md5(combined.encode()).hexdigest()
+    
+    def _normalize_query_for_fingerprint(self, query: str) -> str:
+        """Normalize query for fingerprinting - strip literals
+        
+        'UPDATE users SET status = 'active' WHERE id = 105'
+        becomes:
+        'UPDATE USERS SET STATUS = ? WHERE ID = ?'
+        """
+        if not query:
+            return ''
+        
+        # Replace string literals: 'value' -> ?
+        normalized = re.sub(r"'[^']*'", '?', query)
+        # Replace double-quoted strings: "value" -> ?
+        normalized = re.sub(r'"[^"]*"', '?', normalized)
+        # Replace numeric literals: 123 -> ?
+        normalized = re.sub(r'\b\d+\.?\d*\b', '?', normalized)
+        # Replace hex literals: 0x1234 -> ?
+        normalized = re.sub(r'0x[0-9a-fA-F]+', '?', normalized)
+        # Collapse whitespace
+        normalized = re.sub(r'\s+', ' ', normalized).strip().upper()
+        
+        return normalized
+    
+    def _extract_tables_from_transactions(self, transactions: list) -> str:
+        """Extract unique tables from all transactions as comma-separated string"""
+        tables = set()
+        for tx in transactions:
+            tables.update(tx.get('tables_locked', []))
+        return ','.join(sorted(tables))
+    
+    def _build_locks_summary(self, transactions: list) -> str:
+        """Build a JSON summary of locks involved"""
+        summary = []
+        for tx in transactions:
+            summary.append({
+                'tx_id': tx.get('transaction_id'),
+                'role': tx.get('role'),
+                'lock_mode': tx.get('lock_mode'),
+                'lock_type': tx.get('lock_type'),
+                'tables': tx.get('tables_locked', []),
+            })
+        return json.dumps(summary)
+    
+    # ==========================================================================
+    # Query Validation (existing)
+    # ==========================================================================
+    
     def is_valid_query_for_optimization(self, digest_text: str) -> tuple[bool, str]:
         """
         Check if a query is valid for optimization analysis
@@ -1014,7 +1424,8 @@ class MetricsAPIClient:
             'explains_interval': 600,
             'collect_query_stats': True,
             'collect_explains': True,
-            'collect_schema': True
+            'collect_schema': True,
+            'collect_deadlocks': True
         }
     
     def log(self, message: str, always: bool = False):
@@ -1049,6 +1460,13 @@ class MetricsAPIClient:
             'schema_info': schema_info,
             'tables_involved': tables_involved
         })
+    
+    def send_deadlock(self, deadlock_info: dict) -> bool:
+        """POST deadlock event to /api/v1/deadlocks"""
+        if not self.instructions.get('collect_deadlocks', True):
+            self.log("Deadlock collection disabled by server")
+            return True
+        return self._post('/api/v1/deadlocks', deadlock_info)
     
     def _post(self, endpoint: str, data: dict, max_retries: int = 3) -> bool:
         """Make POST request with JSON body and retry logic"""
@@ -1808,8 +2226,27 @@ class CliPalAgent:
                 self.debug_log("Collecting MySQL metrics...")
                 mysql_metrics = self.mysql_monitor.get_metrics()
                 if mysql_metrics:
+                    # Extract deadlock info for separate handling
+                    deadlock_info = mysql_metrics.pop('deadlock', None)
+                    
                     metrics['mysql'] = mysql_metrics
                     self.debug_log(f"MySQL metrics collected: {len(mysql_metrics)} items")
+                    
+                    # Send deadlock via dedicated endpoint if detected
+                    if deadlock_info:
+                        try:
+                            loop = asyncio.get_event_loop()
+                            success = await loop.run_in_executor(
+                                None, 
+                                self.api_client.send_deadlock, 
+                                deadlock_info
+                            )
+                            if success:
+                                self.log(f"🔴 Sent deadlock event to API (fingerprint: {deadlock_info.get('query_pair_fingerprint', 'N/A')[:8]}...)")
+                            else:
+                                self.log("⚠️ Failed to send deadlock event via REST API")
+                        except Exception as e:
+                            self.log(f"Error sending deadlock event: {e}")
                     
                     # Query stats - use server instructions for interval (default every 5 cycles)
                     query_stats_cycles = self.api_client.instructions.get('query_stats_interval', 300) // 60
