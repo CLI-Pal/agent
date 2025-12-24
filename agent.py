@@ -39,7 +39,7 @@ except ImportError:
 
 import urllib.request
 
-VERSION = "0.0.4"
+VERSION = "0.0.5"
 
 # Configuration file path
 CONFIG_FILE = "/opt/clipal/clipal.conf"
@@ -285,15 +285,20 @@ class MySQLMonitor:
         
         return metrics
     
-    def get_query_stats(self) -> list:
+    def get_query_stats(self, watched_digests: set = None) -> list:
         """
         Phase 2: Collect top slow queries from performance_schema
         Called every 5 minutes (less frequent than main metrics)
+        
+        Args:
+            watched_digests: Optional set of digest hashes to always include regardless of speed.
+                            These are queries the user cares about (bookmarked, AI-analyzed, etc.)
         
         Returns list of query stats from events_statements_summary_by_digest
         """
         if not self.enabled:
             return []
+
         
         try:
             conn = self._connect()
@@ -348,16 +353,23 @@ class MySQLMonitor:
 
             # Filter out invalid queries and fast queries (below threshold)
             # BUT keep queries missing indexes even if fast (preventive optimization)
+            # AND keep watched queries (bookmarked, AI-analyzed) regardless of speed
             queries = []
             filtered_stats = {
                 'total': len(all_queries),
                 'kept': 0,
                 'kept_slow': 0,          # Kept because slow (>= threshold)
                 'kept_no_index': 0,      # Kept because missing index (even if fast)
-                'filtered_fast': 0,      # Below threshold AND has index
+                'kept_watched': 0,       # Kept because in watched list (track optimizations)
+                'filtered_fast': 0,      # Below threshold AND has index AND not watched
                 'filtered_no_cache': 0,
                 'filtered_truncated': 0,
             }
+            
+            # Convert watched_digests to set for O(1) lookup
+            watched_set = set(watched_digests) if watched_digests else set()
+            if watched_set:
+                self.log(f"Watching {len(watched_set)} digests for performance tracking", always=True)
 
             for query_data in all_queries:
                 # Convert AVG_TIMER_WAIT from picoseconds to milliseconds
@@ -369,11 +381,15 @@ class MySQLMonitor:
                 no_index_used = query_data.get('SUM_NO_INDEX_USED', 0) or 0
                 is_missing_index = int(no_index_used) > 0
                 
-                # Keep criteria: slow (>= threshold) OR missing index
+                # Check if query is in watched list (bookmarked, AI-analyzed, has recommendations)
+                digest = query_data.get('DIGEST', '')
+                is_watched = digest in watched_set
+                
+                # Keep criteria: slow (>= threshold) OR missing index OR watched
                 is_slow = avg_time_ms >= self.slow_threshold_ms
                 
-                # Skip only if BOTH fast AND has proper indexes
-                if not is_slow and not is_missing_index:
+                # Skip only if BOTH fast AND has proper indexes AND not watched
+                if not is_slow and not is_missing_index and not is_watched:
                     filtered_stats['filtered_fast'] += 1
                     continue
                 
@@ -383,11 +399,13 @@ class MySQLMonitor:
                 if is_valid:
                     queries.append(query_data)
                     filtered_stats['kept'] += 1
-                    # Track why we kept it
+                    # Track why we kept it (can have multiple reasons)
                     if is_slow:
                         filtered_stats['kept_slow'] += 1
                     if is_missing_index:
                         filtered_stats['kept_no_index'] += 1
+                    if is_watched:
+                        filtered_stats['kept_watched'] += 1
                 else:
                     if 'SQL_NO_CACHE' in skip_reason:
                         filtered_stats['filtered_no_cache'] += 1
@@ -401,7 +419,8 @@ class MySQLMonitor:
             # Log summary
             self.log(
                 f"Query stats filter: {filtered_stats['kept']}/{filtered_stats['total']} kept "
-                f"({filtered_stats['kept_slow']} slow, {filtered_stats['kept_no_index']} missing index), "
+                f"({filtered_stats['kept_slow']} slow, {filtered_stats['kept_no_index']} missing index, "
+                f"{filtered_stats['kept_watched']} watched), "
                 f"filtered: {filtered_stats['filtered_fast']} fast, "
                 f"{filtered_stats['filtered_no_cache']} SQL_NO_CACHE, "
                 f"{filtered_stats['filtered_truncated']} truncated",
@@ -1425,7 +1444,8 @@ class MetricsAPIClient:
             'collect_query_stats': True,
             'collect_explains': True,
             'collect_schema': True,
-            'collect_deadlocks': True
+            'collect_deadlocks': True,
+            'watched_digests': []  # Digests to always collect regardless of speed
         }
     
     def log(self, message: str, always: bool = False):
@@ -2254,7 +2274,9 @@ class CliPalAgent:
                         if self.api_client.instructions.get('collect_query_stats', True):
                             try:
                                 self.debug_log("Collecting query stats from performance_schema...")
-                                query_stats = self.mysql_monitor.get_query_stats()
+                                # Pass watched digests so they're collected regardless of speed
+                                watched = self.api_client.instructions.get('watched_digests', [])
+                                query_stats = self.mysql_monitor.get_query_stats(watched_digests=set(watched))
                                 if query_stats:
                                     metrics['mysql']['query_stats'] = query_stats
                                     self.log(f"📊 Collected {len(query_stats)} query stats from performance_schema")
@@ -2312,7 +2334,9 @@ class CliPalAgent:
         """Collect EXPLAIN plans and schema, send via REST API"""
         self.log("🔍 Starting query optimization analysis...")
         
-        query_stats = self.mysql_monitor.get_query_stats()
+        # Pass watched digests so they're collected regardless of speed
+        watched = self.api_client.instructions.get('watched_digests', [])
+        query_stats = self.mysql_monitor.get_query_stats(watched_digests=set(watched))
         if not query_stats:
             self.debug_log("No query stats available for EXPLAIN analysis")
             return
