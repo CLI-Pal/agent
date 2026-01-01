@@ -582,48 +582,71 @@ else
     log_info "To enable: reinstall with --mysql-root-password=YOUR_ROOT_PASSWORD"
 fi
 
-# Create installation directory
+# Create installation directory with modular structure
 log_info "Creating installation directory..."
-mkdir -p "$INSTALL_DIR"
+mkdir -p "$INSTALL_DIR/lib/database"
 
 log_info "Installing agent..."
+
+# Modular agent file list (11 files)
+AGENT_FILES=(
+    "agent.py"
+    "lib/__init__.py"
+    "lib/config.py"
+    "lib/logger.py"
+    "lib/system_metrics.py"
+    "lib/api_client.py"
+    "lib/websocket_client.py"
+    "lib/terminal_handler.py"
+    "lib/database/__init__.py"
+    "lib/database/base_monitor.py"
+    "lib/database/mysql_monitor.py"
+)
 
 # Download source selection
 DOMAIN="${INSTALL_SERVER:-clipal.me}"
 
 if [ "$INSTALL_DEV" = "true" ]; then
-    log_warn "Using DEV mode - Downloading agent from $DOMAIN/downloads/agent.py"
-    AGENT_URL="https://$DOMAIN/downloads/agent.py"
+    # Dev mode: Download from clipal.me/downloads/agent/
+    log_warn "DEV MODE: Downloading modular agent from $DOMAIN/downloads/agent/"
+    BASE_URL="https://$DOMAIN/downloads/agent"
 else
-    # Default: Download from official GitHub repo
+    # Production: Download from GitHub
     GITHUB_ORG="CLI-Pal"
     GITHUB_REPO="agent"
     BRANCH="${BRANCH:-main}"
-    AGENT_URL="https://raw.githubusercontent.com/$GITHUB_ORG/$GITHUB_REPO/$BRANCH/agent.py"
+    BASE_URL="https://raw.githubusercontent.com/$GITHUB_ORG/$GITHUB_REPO/$BRANCH"
 fi
 
-# Allow overriding URL for testing/development via env var
-if [ -n "$CUSTOM_AGENT_URL" ]; then
-    AGENT_URL="$CUSTOM_AGENT_URL"
-fi
+log_info "Download source: $BASE_URL"
 
-# Enforce HTTPS-only downloads for security
-if [[ "$AGENT_URL" == http://* ]]; then
-    log_error "HTTPS is required for security. HTTP downloads are not allowed."
+# Download each file
+DOWNLOAD_FAILED=0
+for file in "${AGENT_FILES[@]}"; do
+    FILE_PATH="$INSTALL_DIR/$file"
+    FILE_URL="$BASE_URL/$file"
+
+    log_info "Downloading $file..."
+    if ! curl -sSL "$FILE_URL" -o "$FILE_PATH"; then
+        log_error "Failed to download $file"
+        DOWNLOAD_FAILED=1
+        break
+    fi
+
+    # Verify file is not empty
+    if [ ! -s "$FILE_PATH" ]; then
+        log_error "Downloaded file is empty: $file"
+        DOWNLOAD_FAILED=1
+        break
+    fi
+done
+
+if [ $DOWNLOAD_FAILED -eq 1 ]; then
+    log_error "Agent installation failed"
     exit 1
 fi
 
-log_info "Downloading agent from $AGENT_URL..."
-curl -sSL "$AGENT_URL" -o "$INSTALL_DIR/agent.py" || {
-    log_error "Failed to download agent"
-    exit 1
-}
-
-# Verify download
-if [ ! -s "$INSTALL_DIR/agent.py" ]; then
-    log_error "Agent file is empty or missing"
-    exit 1
-fi
+log_info "All ${#AGENT_FILES[@]} agent files downloaded successfully"
 
 # Create wrapper script
 cat > "$BIN_PATH" << 'EOF'
