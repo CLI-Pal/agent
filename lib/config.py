@@ -111,6 +111,19 @@ def _apply_defaults(config: dict) -> dict:
         'pg_password': config.get('pg_password', ''),
         'pg_database': config.get('pg_database', 'postgres'),
         'pg_slow_threshold_ms': int(config.get('pg_slow_threshold_ms', '200')),
+
+        # PHP-FPM settings (optional)
+        # Native FastCGI socket connection (no web server proxy needed)
+        'php_enabled': config.get('php_enabled', 'false').lower() == 'true',
+        # Socket URI: unix:///var/run/php-fpm.sock or tcp://127.0.0.1:9000
+        'php_fpm_socket': config.get('php_fpm_socket', ''),
+        'php_fpm_status_path': config.get('php_fpm_status_path', '/status'),
+        'php_fpm_slow_log': config.get('php_fpm_slow_log', ''),
+        # Multi-pool config: JSON array like:
+        # [{"name":"www","socket":"unix:///var/run/php-fpm.sock","status_path":"/status","slow_log":"/var/log/php-fpm/www-slow.log"}]
+        'php_fpm_pools': config.get('php_fpm_pools', ''),
+        # Legacy HTTP URL (deprecated - triggers migration warning)
+        'php_fpm_status_url': config.get('php_fpm_status_url', ''),
     }
 
 

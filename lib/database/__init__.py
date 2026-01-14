@@ -13,12 +13,11 @@ try:
 except ImportError:
     MYSQL_MONITOR_AVAILABLE = False
 
-# PostgreSQL (future)
-# try:
-#     from .postgres_monitor import PostgreSQLMonitor
-#     POSTGRESQL_MONITOR_AVAILABLE = True
-# except ImportError:
-#     POSTGRESQL_MONITOR_AVAILABLE = False
+try:
+    from .postgres_monitor import PostgreSQLMonitor
+    POSTGRESQL_MONITOR_AVAILABLE = True
+except ImportError:
+    POSTGRESQL_MONITOR_AVAILABLE = False
 
 
 class NullMonitor(DatabaseMonitor):
@@ -63,6 +62,10 @@ def create_database_monitor(config: dict, logger):
     if db_type == 'none' and config.get('mysql_enabled', False):
         db_type = 'mysql'
 
+    # Legacy support: check pg_enabled flag
+    if db_type == 'none' and config.get('pg_enabled', False):
+        db_type = 'postgresql'
+
     # Create appropriate monitor based on explicit config
     if db_type == 'mysql' and MYSQL_MONITOR_AVAILABLE:
         mysql_user = config.get('mysql_user', '')
@@ -83,8 +86,30 @@ def create_database_monitor(config: dict, logger):
             logger.warn("MySQL credentials not configured - monitoring disabled")
             return NullMonitor(logger)
 
-    # elif db_type == 'postgresql' and POSTGRESQL_MONITOR_AVAILABLE:
-    #     return PostgreSQLMonitor(...)
+    elif db_type == 'postgresql' and POSTGRESQL_MONITOR_AVAILABLE:
+        pg_user = config.get('pg_user', '')
+        pg_password = config.get('pg_password', '')
+
+        if pg_user and pg_password:
+            logger.info("Creating PostgreSQL monitor", always=True)
+            return PostgreSQLMonitor(
+                host=config.get('pg_host', 'localhost'),
+                port=config.get('pg_port', 5432),
+                user=pg_user,
+                password=pg_password,
+                database=config.get('pg_database', 'postgres'),
+                debug=config.get('debug', False),
+                slow_threshold_ms=config.get('pg_slow_threshold_ms', 200),
+                logger=logger.create_child("PostgreSQL")
+            )
+        else:
+            logger.warn("PostgreSQL credentials not configured - monitoring disabled")
+            return NullMonitor(logger)
+
+    elif db_type == 'postgresql' and not POSTGRESQL_MONITOR_AVAILABLE:
+        logger.warn("PostgreSQL monitoring requested but psycopg2 not installed")
+        logger.warn("Install with: pip3 install psycopg2-binary")
+        return NullMonitor(logger)
 
     else:
         # Return null monitor (disabled or invalid type)

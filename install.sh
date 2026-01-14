@@ -3,8 +3,11 @@ set -e
 
 # CLI Pal Agent Installation Script
 # Usage: 
-#   Install:   curl -sSL https://clipal.me/install.sh | sudo bash -s -- --token=YOUR_TOKEN [--mysql-root-password=PASSWORD] [--enable-performance-schema]
-#   Uninstall: curl -sSL https://clipal.me/install.sh | sudo bash -s -- uninstall
+#   MySQL:      curl -sSL https://clipal.me/install.sh | sudo bash -s -- --token=YOUR_TOKEN --mysql-root-password=PASSWORD [--enable-performance-schema]
+#   PostgreSQL: curl -sSL https://clipal.me/install.sh | sudo bash -s -- --token=YOUR_TOKEN --pg-superuser-password=PASSWORD
+#   PHP-FPM:    curl -sSL https://clipal.me/install.sh | sudo bash -s -- --token=YOUR_TOKEN --enable-php-monitoring
+#   No DB:      curl -sSL https://clipal.me/install.sh | sudo bash -s -- --token=YOUR_TOKEN --db-type=none
+#   Uninstall:  curl -sSL https://clipal.me/install.sh | sudo bash -s -- uninstall
 
 INSTALL_DIR="/opt/clipal"
 BIN_PATH="/usr/local/bin/clipal-agent"
@@ -96,12 +99,25 @@ done
 # Parse arguments for installation
 TOKEN=""
 SERVER_URL="${WS_SERVER:-wss://app.clipal.me/ws}"
+DB_TYPE=""  # Will be set based on flags or explicit --db-type
 MYSQL_ROOT_PASSWORD=""
 MYSQL_USER=""
 MYSQL_PASSWORD=""
 MYSQL_HOST="localhost"
 MYSQL_PORT="3306"
 ENABLE_PERFORMANCE_SCHEMA="false"
+PG_SUPERUSER_PASSWORD=""
+PG_USER=""
+PG_PASSWORD=""
+PG_HOST="localhost"
+PG_PORT="5432"
+PG_DATABASE="postgres"
+
+# PHP-FPM monitoring
+PHP_ENABLED="false"
+PHP_FPM_SOCKET=""
+PHP_FPM_STATUS_PATH="/status"
+PHP_FPM_SLOW_LOG=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -111,6 +127,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --server=*)
             SERVER_URL="${1#*=}"
+            shift
+            ;;
+        --db-type=*)
+            DB_TYPE="${1#*=}"
             shift
             ;;
         --mysql-root-password=*)
@@ -137,6 +157,46 @@ while [[ $# -gt 0 ]]; do
             ENABLE_PERFORMANCE_SCHEMA="true"
             shift
             ;;
+        --pg-superuser-password=*)
+            PG_SUPERUSER_PASSWORD="${1#*=}"
+            shift
+            ;;
+        --pg-user=*)
+            PG_USER="${1#*=}"
+            shift
+            ;;
+        --pg-password=*)
+            PG_PASSWORD="${1#*=}"
+            shift
+            ;;
+        --pg-host=*)
+            PG_HOST="${1#*=}"
+            shift
+            ;;
+        --pg-port=*)
+            PG_PORT="${1#*=}"
+            shift
+            ;;
+        --pg-database=*)
+            PG_DATABASE="${1#*=}"
+            shift
+            ;;
+        --enable-php-monitoring)
+            PHP_ENABLED="true"
+            shift
+            ;;
+        --php-socket=*)
+            PHP_FPM_SOCKET="${1#*=}"
+            shift
+            ;;
+        --php-status-path=*)
+            PHP_FPM_STATUS_PATH="${1#*=}"
+            shift
+            ;;
+        --php-slow-log=*)
+            PHP_FPM_SLOW_LOG="${1#*=}"
+            shift
+            ;;
         --dev)
             INSTALL_DEV="true"
             shift
@@ -150,6 +210,26 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Validate --db-type if provided
+if [ -n "$DB_TYPE" ] && [ "$DB_TYPE" != "mysql" ] && [ "$DB_TYPE" != "postgresql" ] && [ "$DB_TYPE" != "none" ]; then
+    log_error "Invalid --db-type: $DB_TYPE"
+    log_error "Valid options: mysql, postgresql, none"
+    exit 1
+fi
+
+# Infer db_type from credentials if not explicitly set
+if [ -z "$DB_TYPE" ]; then
+    if [ -n "$MYSQL_ROOT_PASSWORD" ] || [ -n "$MYSQL_USER" ]; then
+        DB_TYPE="mysql"
+    elif [ -n "$PG_SUPERUSER_PASSWORD" ] || [ -n "$PG_USER" ]; then
+        DB_TYPE="postgresql"
+    else
+        DB_TYPE="none"
+    fi
+fi
+
+log_info "Database type: $DB_TYPE"
 
 # Validate token (only needed for installation, not uninstall)
 if [ -z "$TOKEN" ]; then
@@ -212,8 +292,13 @@ log_info "Installing Python dependencies..."
 REQUIRED_PACKAGES="websockets psutil"
 
 # Add MySQL connector if MySQL monitoring is enabled
-if [ -n "$MYSQL_ROOT_PASSWORD" ] || [ -n "$MYSQL_USER" ]; then
+if [ "$DB_TYPE" = "mysql" ]; then
     REQUIRED_PACKAGES="$REQUIRED_PACKAGES mysql-connector-python"
+fi
+
+# Add PostgreSQL connector if PostgreSQL monitoring is enabled
+if [ "$DB_TYPE" = "postgresql" ]; then
+    REQUIRED_PACKAGES="$REQUIRED_PACKAGES psycopg2-binary"
 fi
 
 PIP_ROOT_USER_ACTION=ignore pip3 install $REQUIRED_PACKAGES --quiet || PIP_ROOT_USER_ACTION=ignore python3 -m pip install $REQUIRED_PACKAGES --quiet
@@ -577,18 +662,183 @@ PERFEOF
     fi
 elif [ -n "$MYSQL_USER" ] && [ -n "$MYSQL_PASSWORD" ]; then
     log_info "Using provided MySQL credentials for monitoring"
-else
-    log_info "MySQL monitoring disabled (no credentials provided)"
-    log_info "To enable: reinstall with --mysql-root-password=YOUR_ROOT_PASSWORD"
 fi
 
-# Create installation directory with modular structure
+# ==========================================
+# PostgreSQL Setup
+# ==========================================
+if [ "$DB_TYPE" = "postgresql" ]; then
+    if [ -n "$PG_SUPERUSER_PASSWORD" ]; then
+        log_info "Setting up PostgreSQL monitoring..."
+        
+        # Check if psql is available
+        if ! command -v psql &> /dev/null; then
+            log_warn "PostgreSQL client (psql) not found. Skipping PostgreSQL setup."
+            log_info "Install PostgreSQL client or use --pg-user/--pg-password instead"
+        else
+            # Create temporary pgpass file for authentication
+            PGPASS_FILE=$(mktemp)
+            chmod 600 "$PGPASS_FILE"
+            echo "$PG_HOST:$PG_PORT:*:postgres:$PG_SUPERUSER_PASSWORD" > "$PGPASS_FILE"
+            export PGPASSFILE="$PGPASS_FILE"
+            
+            # Test connection
+            log_info "Verifying PostgreSQL superuser access..."
+            set +e
+            PG_TEST=$(psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -d postgres -c "SELECT 1" 2>&1)
+            PG_EXIT=$?
+            set -e
+            
+            if [ $PG_EXIT -ne 0 ]; then
+                log_error "Failed to connect to PostgreSQL as superuser"
+                log_error "Error: $PG_TEST"
+                log_error "Please verify:"
+                log_error "  - PostgreSQL is running"
+                log_error "  - Superuser password is correct"
+                log_error "  - PostgreSQL is listening on $PG_HOST:$PG_PORT"
+                rm -f "$PGPASS_FILE"
+                exit 1
+            fi
+            
+            log_info "✅ PostgreSQL superuser connection verified"
+            
+            # Generate secure random password for clipal user
+            PG_PASSWORD=$(python3 -c "import secrets,string; print(''.join(secrets.choice(string.ascii_letters + string.digits) for i in range(32)))")
+            PG_USER="clipal"
+            
+            log_info "Creating PostgreSQL monitoring user '$PG_USER'..."
+            
+            # Create monitoring user with appropriate permissions
+            set +e
+            PG_CREATE=$(psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -d postgres 2>&1 <<PGSQL
+-- Create monitoring user (if not exists)
+DO \$\$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '$PG_USER') THEN
+        CREATE USER $PG_USER WITH PASSWORD '$PG_PASSWORD';
+    ELSE
+        ALTER USER $PG_USER WITH PASSWORD '$PG_PASSWORD';
+    END IF;
+END
+\$\$;
+
+-- Grant monitoring permissions
+GRANT pg_monitor TO $PG_USER;
+GRANT CONNECT ON DATABASE postgres TO $PG_USER;
+PGSQL
+)
+            PG_CREATE_EXIT=$?
+            set -e
+            
+            if [ $PG_CREATE_EXIT -eq 0 ]; then
+                log_info "✅ PostgreSQL monitoring user created successfully"
+                
+                # Verify the user can connect
+                sleep 1
+                echo "$PG_HOST:$PG_PORT:*:$PG_USER:$PG_PASSWORD" > "$PGPASS_FILE"
+                
+                set +e
+                PG_VERIFY=$(psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d postgres -c "SELECT 1" 2>&1)
+                PG_VERIFY_EXIT=$?
+                set -e
+                
+                if [ $PG_VERIFY_EXIT -eq 0 ]; then
+                    log_info "✅ PostgreSQL connection verified successfully"
+                else
+                    log_warn "⚠️  Warning: Could not verify PostgreSQL connection with generated password"
+                    log_warn "   Error: $PG_VERIFY"
+                fi
+                
+                # Configure pg_stat_statements in postgresql.conf
+                log_info "Checking pg_stat_statements configuration..."
+                PG_CONF_FILE=$(psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -d postgres -t -c "SHOW config_file" 2>/dev/null | xargs)
+                
+                if [ -f "$PG_CONF_FILE" ] && [ -w "$PG_CONF_FILE" ]; then
+                    # Check if pg_stat_statements is already in shared_preload_libraries
+                    if ! grep -q "shared_preload_libraries.*pg_stat_statements" "$PG_CONF_FILE" 2>/dev/null; then
+                        log_info "Enabling pg_stat_statements in $PG_CONF_FILE..."
+                        # Backup config file
+                        cp "$PG_CONF_FILE" "${PG_CONF_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+                        
+                        # Add/update shared_preload_libraries
+                        if grep -q "^shared_preload_libraries" "$PG_CONF_FILE"; then
+                            # Append to existing line
+                            sed -i "s/^shared_preload_libraries = '\(.*\)'/shared_preload_libraries = '\1,pg_stat_statements'/" "$PG_CONF_FILE"
+                        else
+                            # Add new line
+                            echo "" >> "$PG_CONF_FILE"
+                            echo "# CLI Pal: Enable query statistics" >> "$PG_CONF_FILE"
+                            echo "shared_preload_libraries = 'pg_stat_statements'" >> "$PG_CONF_FILE"
+                        fi
+                        
+                        # Add pg_stat_statements configuration
+                        if ! grep -q "^pg_stat_statements" "$PG_CONF_FILE"; then
+                            echo "pg_stat_statements.track = all" >> "$PG_CONF_FILE"
+                            echo "pg_stat_statements.max = 10000" >> "$PG_CONF_FILE"
+                        fi
+                        
+                        log_warn "⚠️  Restarting PostgreSQL to enable pg_stat_statements..."
+                        if systemctl restart postgresql 2>/dev/null || systemctl restart postgresql-* 2>/dev/null; then
+                            sleep 3
+                            log_info "✅ PostgreSQL restarted successfully"
+                        else
+                            log_warn "⚠️  Could not restart PostgreSQL automatically"
+                            log_warn "   Please restart manually: sudo systemctl restart postgresql"
+                        fi
+                    else
+                        log_info "✅ pg_stat_statements already configured"
+                    fi
+                    
+                    # Now try to create the extension
+                    sleep 2
+                    set +e
+                    PG_EXT_CREATE=$(psql -h "$PG_HOST" -p "$PG_PORT" -U postgres -d postgres -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;" 2>&1)
+                    PG_EXT_EXIT=$?
+                    set -e
+                    
+                    if [ $PG_EXT_EXIT -eq 0 ]; then
+                        log_info "✅ pg_stat_statements extension enabled"
+                    else
+                        log_warn "⚠️  Could not create pg_stat_statements extension"
+                        log_warn "   Error: $PG_EXT_CREATE"
+                        log_warn "   Query statistics may not be available until PostgreSQL is restarted"
+                    fi
+                else
+                    log_warn "⚠️  Cannot modify PostgreSQL config file (not writable or not found)"
+                    log_warn "   Config file: $PG_CONF_FILE"
+                    log_warn "   To enable pg_stat_statements manually:"
+                    log_warn "     1. Add to postgresql.conf: shared_preload_libraries = 'pg_stat_statements'"
+                    log_warn "     2. Restart PostgreSQL"
+                    log_warn "     3. Run: CREATE EXTENSION pg_stat_statements;"
+                fi
+            else
+                log_error "Failed to create PostgreSQL user"
+                log_error "Error: $PG_CREATE"
+                PG_USER=""
+                PG_PASSWORD=""
+            fi
+            
+            # Clean up
+            rm -f "$PGPASS_FILE"
+            unset PGPASSFILE
+            unset PG_SUPERUSER_PASSWORD
+        fi
+    elif [ -n "$PG_USER" ] && [ -n "$PG_PASSWORD" ]; then
+        log_info "Using provided PostgreSQL credentials for monitoring"
+    else
+        log_error "PostgreSQL monitoring requires credentials"
+        log_error "Use --pg-superuser-password=PASSWORD or --pg-user/--pg-password"
+        exit 1
+    fi
+fi
+
+# Create installation directory
 log_info "Creating installation directory..."
-mkdir -p "$INSTALL_DIR/lib/database"
+mkdir -p "$INSTALL_DIR"
 
 log_info "Installing agent..."
 
-# Modular agent file list (11 files)
+# Modular agent file list (13 files)
 AGENT_FILES=(
     "agent.py"
     "lib/__init__.py"
@@ -598,9 +848,11 @@ AGENT_FILES=(
     "lib/api_client.py"
     "lib/websocket_client.py"
     "lib/terminal_handler.py"
+    "lib/php_monitor.py"
     "lib/database/__init__.py"
     "lib/database/base_monitor.py"
     "lib/database/mysql_monitor.py"
+    "lib/database/postgres_monitor.py"
 )
 
 # Download source selection
@@ -625,6 +877,10 @@ DOWNLOAD_FAILED=0
 for file in "${AGENT_FILES[@]}"; do
     FILE_PATH="$INSTALL_DIR/$file"
     FILE_URL="$BASE_URL/$file"
+
+    # Create directory for this file if needed
+    FILE_DIR="$INSTALL_DIR/$(dirname "$file")"
+    mkdir -p "$FILE_DIR"
 
     log_info "Downloading $file..."
     if ! curl -sSL "$FILE_URL" -o "$FILE_PATH"; then
@@ -660,6 +916,21 @@ chmod +x "$BIN_PATH"
 log_info "Creating configuration file..."
 
 CONFIG_PATH="$INSTALL_DIR/clipal.conf"
+
+# Preserve existing configuration if present
+PRESERVED_PHP_POOLS=""
+if [ -f "$CONFIG_PATH" ]; then
+    log_info "Backing up existing configuration..."
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
+    log_info "✅ Backup saved to ${CONFIG_PATH}.bak"
+    
+    # Extract php_fpm_pools if present (for multi-pool setups configured manually)
+    PRESERVED_PHP_POOLS=$(grep "^php_fpm_pools=" "$CONFIG_PATH" 2>/dev/null | cut -d'=' -f2- || true)
+    if [ -n "$PRESERVED_PHP_POOLS" ]; then
+        log_info "📋 Preserving existing PHP multi-pool configuration"
+    fi
+fi
+
 cat > "$CONFIG_PATH" << CONFIG_EOF
 # CLI Pal Agent Configuration
 # Auto-generated during installation on $(date)
@@ -670,11 +941,17 @@ api_key=$TOKEN
 server_url=$SERVER_URL
 CONFIG_EOF
 
+# Add database type
+cat >> "$CONFIG_PATH" << DB_TYPE_EOF
+
+# Database Monitoring
+# Options: mysql, postgresql, none
+db_type=$DB_TYPE
+DB_TYPE_EOF
+
 # Add MySQL configuration if enabled
 if [ -n "$MYSQL_USER" ] && [ -n "$MYSQL_PASSWORD" ]; then
     cat >> "$CONFIG_PATH" << MYSQL_CONFIG_EOF
-
-# MySQL Monitoring
 mysql_enabled=true
 mysql_host=$MYSQL_HOST
 mysql_port=$MYSQL_PORT
@@ -685,6 +962,334 @@ MYSQL_CONFIG_EOF
     # Add mysql_cnf_file if detected during performance_schema setup
     if [ -n "$MYSQL_CNF_FILE" ]; then
         echo "mysql_cnf_file=$MYSQL_CNF_FILE" >> "$CONFIG_PATH"
+    fi
+fi
+
+# Add PostgreSQL configuration if enabled
+if [ -n "$PG_USER" ] && [ -n "$PG_PASSWORD" ]; then
+    cat >> "$CONFIG_PATH" << PG_CONFIG_EOF
+pg_enabled=true
+pg_host=$PG_HOST
+pg_port=$PG_PORT
+pg_user=$PG_USER
+pg_password=$PG_PASSWORD
+pg_database=$PG_DATABASE
+PG_CONFIG_EOF
+fi
+
+# Add PHP-FPM configuration if enabled
+if [ "$PHP_ENABLED" = "true" ]; then
+    log_info "Configuring PHP-FPM monitoring (native FastCGI)..."
+    
+    # Check if we have preserved multi-pool config from previous install
+    if [ -n "$PRESERVED_PHP_POOLS" ]; then
+        log_info "✅ Using preserved multi-pool configuration"
+        # Skip socket detection, use preserved config directly
+        cat >> "$CONFIG_PATH" << PHP_PRESERVED_EOF
+
+# PHP-FPM Monitoring (native FastCGI - preserved from previous install)
+php_enabled=true
+php_fpm_pools=$PRESERVED_PHP_POOLS
+php_fpm_status_path=$PHP_FPM_STATUS_PATH
+PHP_PRESERVED_EOF
+    # Auto-detect PHP-FPM socket if not provided
+    elif [ -z "$PHP_FPM_SOCKET" ]; then
+        log_info "Searching for PHP-FPM sockets..."
+        
+        # Common socket paths by distribution/control panel
+        COMMON_SOCKETS=(
+            # Standard paths
+            "/var/run/php-fpm.sock"
+            "/var/run/php/php-fpm.sock"
+            "/run/php-fpm/www.sock"
+            "/run/php/php-fpm.sock"
+            # Version-specific (Ubuntu/Debian)
+            "/var/run/php/php8.3-fpm.sock"
+            "/var/run/php/php8.2-fpm.sock"
+            "/var/run/php/php8.1-fpm.sock"
+            "/var/run/php/php8.0-fpm.sock"
+            "/var/run/php/php7.4-fpm.sock"
+            # CentOS/RHEL
+            "/var/run/php-fpm/www.sock"
+            "/run/php-fpm/www.sock"
+            # Webuzo (per-user pools: fpm-USERNAME.sock)
+            # Note: Webuzo uses /var/fpm-*.sock, not /var/run/
+            # cPanel
+            "/opt/cpanel/ea-php74/root/var/run/php-fpm.sock"
+            "/opt/cpanel/ea-php80/root/var/run/php-fpm.sock"
+            "/opt/cpanel/ea-php81/root/var/run/php-fpm.sock"
+            "/opt/cpanel/ea-php82/root/var/run/php-fpm.sock"
+            "/opt/cpanel/ea-php83/root/var/run/php-fpm.sock"
+            # Plesk
+            "/var/run/plesk-php74-fpm.sock"
+            "/var/run/plesk-php80-fpm.sock"
+            "/var/run/plesk-php81-fpm.sock"
+            "/var/run/plesk-php82-fpm.sock"
+            "/var/run/plesk-php83-fpm.sock"
+        )
+        
+        # Also try glob patterns
+        SOCKET_GLOBS=(
+            "/var/run/php*.sock"
+            "/var/run/php/*.sock"
+            "/run/php-fpm/*.sock"
+            "/run/php/*.sock"
+            # Webuzo: /usr/local/apps/php82/var/fpm-USERNAME.sock
+            "/usr/local/apps/php*/var/*.sock"
+            "/usr/local/apps/php*/var/fpm-*.sock"
+            "/opt/cpanel/ea-php*/root/var/run/*.sock"
+        )
+        
+        # Check explicit paths first
+        for sock in "${COMMON_SOCKETS[@]}"; do
+            if [ -S "$sock" ]; then
+                PHP_FPM_SOCKET="unix://$sock"
+                log_info "✅ Found PHP-FPM socket: $sock"
+                break
+            fi
+        done
+        
+        # If not found, try glob patterns
+        if [ -z "$PHP_FPM_SOCKET" ]; then
+            for pattern in "${SOCKET_GLOBS[@]}"; do
+                for sock in $pattern; do
+                    if [ -S "$sock" ] 2>/dev/null; then
+                        PHP_FPM_SOCKET="unix://$sock"
+                        log_info "✅ Found PHP-FPM socket: $sock"
+                        break 2
+                    fi
+                done
+            done
+        fi
+        
+        # Also check for TCP listeners on port 9000
+        if [ -z "$PHP_FPM_SOCKET" ]; then
+            if command -v ss &> /dev/null; then
+                if ss -tlnp | grep -q ':9000 '; then
+                    PHP_FPM_SOCKET="tcp://127.0.0.1:9000"
+                    log_info "✅ Found PHP-FPM listening on TCP port 9000"
+                fi
+            elif command -v netstat &> /dev/null; then
+                if netstat -tlnp 2>/dev/null | grep -q ':9000 '; then
+                    PHP_FPM_SOCKET="tcp://127.0.0.1:9000"
+                    log_info "✅ Found PHP-FPM listening on TCP port 9000"
+                fi
+            fi
+        fi
+        
+        if [ -z "$PHP_FPM_SOCKET" ]; then
+            log_error "❌ Could not find PHP-FPM socket"
+            log_error "   Please specify manually: --php-socket=unix:///path/to/php-fpm.sock"
+            log_error "   Or for TCP: --php-socket=tcp://127.0.0.1:9000"
+            log_info ""
+            log_info "   Common socket locations:"
+            log_info "     Ubuntu/Debian: /var/run/php/php8.x-fpm.sock"
+            log_info "     CentOS/RHEL:   /var/run/php-fpm/www.sock"
+            log_info "     Webuzo:        /usr/local/apps/php8x/var/run/php-fpm.sock"
+            log_info "     cPanel:        /opt/cpanel/ea-php8x/root/var/run/php-fpm.sock"
+            log_info ""
+            log_info "   You can find your socket with: find /var/run -name '*.sock' 2>/dev/null | grep php"
+            PHP_ENABLED="false"
+        fi
+    else
+        # User provided socket path - add unix:// prefix if needed
+        if [[ ! "$PHP_FPM_SOCKET" =~ ^(unix|tcp):// ]]; then
+            PHP_FPM_SOCKET="unix://$PHP_FPM_SOCKET"
+            log_info "Added unix:// prefix to socket path"
+        fi
+    fi
+    
+    # Verify FastCGI connection using Python
+    if [ "$PHP_ENABLED" = "true" ] && [ -n "$PHP_FPM_SOCKET" ]; then
+        log_info "Verifying PHP-FPM connection via FastCGI..."
+        
+        # Disable set -e for this block to handle Python errors gracefully
+        set +e
+        VERIFY_RESULT=$(python3 2>&1 << PYEOF
+import socket
+import struct
+import sys
+import json
+
+socket_uri = "$PHP_FPM_SOCKET"
+status_path = "$PHP_FPM_STATUS_PATH"
+
+# FastCGI constants
+FCGI_BEGIN_REQUEST = 1
+FCGI_PARAMS = 4
+FCGI_STDIN = 5
+FCGI_STDOUT = 6
+FCGI_END_REQUEST = 3
+FCGI_RESPONDER = 1
+
+def recv_exact(sock, size):
+    """Read exactly 'size' bytes, handling partial reads."""
+    data = b''
+    while len(data) < size:
+        chunk = sock.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError(f"Connection closed after {len(data)}/{size} bytes")
+        data += chunk
+    return data
+
+def build_record(rtype, content, request_id=1):
+    clen = len(content)
+    plen = (8 - (clen % 8)) % 8
+    header = struct.pack('>BBHHBx', 1, rtype, request_id, clen, plen)
+    return header + content + (b'\x00' * plen)
+
+def encode_params(params):
+    result = b''
+    for k, v in params.items():
+        kb, vb = k.encode(), v.encode()
+        kl, vl = len(kb), len(vb)
+        result += struct.pack('B', kl) if kl < 128 else struct.pack('>I', kl | 0x80000000)
+        result += struct.pack('B', vl) if vl < 128 else struct.pack('>I', vl | 0x80000000)
+        result += kb + vb
+    return result
+
+try:
+    # Parse URI
+    if socket_uri.startswith('unix://'):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(5.0)
+        sock.connect(socket_uri[7:])
+    elif socket_uri.startswith('tcp://'):
+        host_port = socket_uri[6:]
+        host, port = host_port.rsplit(':', 1)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5.0)
+        sock.connect((host, int(port)))
+    else:
+        print("ERROR:Invalid socket URI format")
+        sys.exit(0)
+    
+    # Send BEGIN_REQUEST
+    sock.sendall(build_record(FCGI_BEGIN_REQUEST, struct.pack('>HB5x', FCGI_RESPONDER, 0)))
+    
+    # Send PARAMS
+    params = {
+        'SCRIPT_NAME': status_path,
+        'SCRIPT_FILENAME': status_path,
+        'REQUEST_METHOD': 'GET',
+        'QUERY_STRING': 'json',
+        'SERVER_PROTOCOL': 'HTTP/1.1',
+    }
+    sock.sendall(build_record(FCGI_PARAMS, encode_params(params)))
+    sock.sendall(build_record(FCGI_PARAMS, b''))
+    sock.sendall(build_record(FCGI_STDIN, b''))
+    
+    # Read response with robust recv loop (handles partial reads)
+    stdout = b''
+    while True:
+        # Read 8-byte header with exact recv
+        header = recv_exact(sock, 8)
+        _, rtype, _, clen, plen = struct.unpack('>BBHHBx', header)
+        
+        # Read content + padding with exact recv
+        total = clen + plen
+        data = recv_exact(sock, total) if total > 0 else b''
+        
+        if rtype == FCGI_STDOUT:
+            stdout += data[:clen]
+        elif rtype == FCGI_END_REQUEST:
+            break
+    
+    sock.close()
+    
+    response = stdout.decode('utf-8', errors='replace')
+    
+    if 'File not found' in response or 'Status: 404' in response:
+        print("ERROR:Status page not found. Enable pm.status_path in PHP-FPM config")
+        sys.exit(0)
+    elif 'Access denied' in response:
+        print("ERROR:Access denied. Check pm.status_listen in PHP-FPM config")
+        sys.exit(0)
+    elif '"pool"' in response or '"accepted conn"' in response:
+        print("OK")
+    else:
+        print("WARN:Connected but response unclear - check agent logs after start")
+        
+except socket.timeout:
+    print("ERROR:Connection timeout")
+    sys.exit(0)
+except ConnectionError as e:
+    print(f"ERROR:{e}")
+    sys.exit(0)
+except OSError as e:
+    print(f"ERROR:Cannot connect - {e}")
+    sys.exit(0)
+except Exception as e:
+    print(f"ERROR:{e}")
+    sys.exit(0)  # Don't crash installer, just report the error
+PYEOF
+)
+        PYTHON_EXIT=$?
+        set -e
+        
+        # Handle empty result (Python crashed before printing anything)
+        if [ -z "$VERIFY_RESULT" ]; then
+            if [ $PYTHON_EXIT -ne 0 ]; then
+                VERIFY_RESULT="ERROR:Python verification script crashed (exit code $PYTHON_EXIT)"
+            else
+                VERIFY_RESULT="ERROR:Unknown error during verification"
+            fi
+        fi
+        
+        if [[ "$VERIFY_RESULT" == "OK" ]]; then
+            log_info "✅ PHP-FPM FastCGI connection verified"
+        elif [[ "$VERIFY_RESULT" == WARN:* ]]; then
+            log_warn "⚠️  ${VERIFY_RESULT#WARN:}"
+        elif [[ "$VERIFY_RESULT" == ERROR:* ]]; then
+            log_error "❌ PHP-FPM verification failed: ${VERIFY_RESULT#ERROR:}"
+            log_error ""
+            log_error "   To enable PHP-FPM status, add to your PHP-FPM pool config:"
+            log_error "     pm.status_path = $PHP_FPM_STATUS_PATH"
+            log_error ""
+            log_error "   Then restart PHP-FPM: systemctl restart php-fpm"
+            log_error ""
+            PHP_ENABLED="false"
+        else
+            log_warn "⚠️  Unexpected verification result: $VERIFY_RESULT"
+        fi
+    fi
+    
+    # Auto-detect slowlog path if not provided
+    if [ "$PHP_ENABLED" = "true" ] && [ -z "$PHP_FPM_SLOW_LOG" ]; then
+        COMMON_SLOWLOGS=(
+            "/var/log/php-fpm/www-slow.log"
+            "/var/log/php8.3-fpm-slow.log"
+            "/var/log/php8.2-fpm-slow.log"
+            "/var/log/php8.1-fpm-slow.log"
+            "/var/log/php8.0-fpm-slow.log"
+            "/var/log/php7.4-fpm-slow.log"
+            "/var/log/php-fpm/slow.log"
+            "/var/log/php-fpm.slow.log"
+        )
+        
+        for log in "${COMMON_SLOWLOGS[@]}"; do
+            if [ -f "$log" ] && [ -r "$log" ]; then
+                PHP_FPM_SLOW_LOG="$log"
+                log_info "✅ Found PHP-FPM slow log: $log"
+                break
+            fi
+        done
+        
+        if [ -z "$PHP_FPM_SLOW_LOG" ]; then
+            log_info "ℹ️  No PHP-FPM slowlog found (optional - only needed for slow request tracing)"
+        fi
+    fi
+    
+    # Write PHP config if still enabled AND not using preserved config
+    if [ "$PHP_ENABLED" = "true" ] && [ -z "$PRESERVED_PHP_POOLS" ]; then
+        cat >> "$CONFIG_PATH" << PHP_CONFIG_EOF
+
+# PHP-FPM Monitoring (native FastCGI - no web server proxy needed)
+php_enabled=true
+php_fpm_socket=$PHP_FPM_SOCKET
+php_fpm_status_path=$PHP_FPM_STATUS_PATH
+php_fpm_slow_log=$PHP_FPM_SLOW_LOG
+PHP_CONFIG_EOF
     fi
 fi
 
@@ -727,13 +1332,27 @@ if systemctl is-active --quiet clipal-agent; then
     log_info "✅ CLI Pal Agent installed and running successfully!"
     echo ""
     
-    # Show MySQL monitoring status
-    if [ -n "$MYSQL_USER" ]; then
+    # Show database monitoring status
+    if [ "$DB_TYPE" = "mysql" ] && [ -n "$MYSQL_USER" ]; then
         log_info "📊 MySQL monitoring: ENABLED"
         echo "     User: $MYSQL_USER@$MYSQL_HOST:$MYSQL_PORT"
+    elif [ "$DB_TYPE" = "postgresql" ] && [ -n "$PG_USER" ]; then
+        log_info "📊 PostgreSQL monitoring: ENABLED"
+        echo "     User: $PG_USER@$PG_HOST:$PG_PORT/$PG_DATABASE"
     else
-        echo "📊 MySQL monitoring: DISABLED"
-        echo "   To enable: reinstall with --mysql-root-password=YOUR_ROOT_PASSWORD"
+        echo "📊 Database monitoring: DISABLED"
+        echo "   To enable MySQL: reinstall with --mysql-root-password=YOUR_ROOT_PASSWORD"
+        echo "   To enable PostgreSQL: reinstall with --pg-superuser-password=YOUR_PASSWORD"
+    fi
+    
+    # Show PHP monitoring status
+    if [ "$PHP_ENABLED" = "true" ]; then
+        log_info "📊 PHP-FPM monitoring: ENABLED (native FastCGI)"
+        echo "     Socket: $PHP_FPM_SOCKET"
+        echo "     Status path: $PHP_FPM_STATUS_PATH"
+        if [ -n "$PHP_FPM_SLOW_LOG" ]; then
+            echo "     Slow log: $PHP_FPM_SLOW_LOG"
+        fi
     fi
     
     echo ""

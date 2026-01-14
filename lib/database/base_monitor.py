@@ -82,6 +82,18 @@ class DatabaseMonitor(ABC):
         """
         pass
 
+    def check_for_deadlock(self, current_status: dict) -> Optional[dict]:
+        """Check if a new deadlock occurred
+
+        Args:
+            current_status: Dict of current database status
+
+        Returns:
+            Parsed deadlock info dict if new deadlock detected, None otherwise
+        """
+        # Default implementation - subclasses can override
+        return None
+
     def is_valid_query_for_optimization(self, query: str) -> Tuple[bool, str]:
         """Check if query is valid for optimization analysis
 

@@ -25,7 +25,27 @@ from lib.websocket_client import WebSocketClient
 from lib.terminal_handler import TerminalHandler
 from lib.database import create_database_monitor
 
-VERSION = "0.1.0"
+VERSION = "0.1.2"
+
+# Optional PHP monitor (only loaded if enabled)
+def _create_php_monitor(config: dict, logger):
+    """Create PHP monitor if enabled and available"""
+    if not config.get('php_enabled'):
+        return None
+    try:
+        from lib.php_monitor import PHPMonitor
+        monitor = PHPMonitor(config, logger.create_child("PHP"))
+        if monitor.is_available():
+            return monitor
+        else:
+            logger.warn("PHP-FPM not accessible, disabling PHP monitoring")
+            return None
+    except ImportError:
+        logger.debug("PHP monitor module not available")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to initialize PHP monitor: {e}")
+        return None
 
 
 class CliPalAgent:
@@ -50,6 +70,7 @@ class CliPalAgent:
         # Initialize components
         self.system_metrics = SystemMetrics(logger.create_child("System"))
         self.database_monitor = create_database_monitor(config, logger)
+        self.php_monitor = _create_php_monitor(config, logger)
 
         # REST API client for metrics (one-way HTTP POST)
         self.api_client = MetricsAPIClient(
@@ -103,6 +124,12 @@ class CliPalAgent:
                 self.logger.info("📊 Database monitoring enabled", always=True)
         else:
             self.logger.info("Database monitoring disabled", always=True)
+
+        # Log PHP monitor status
+        if self.php_monitor:
+            self.logger.info("📊 PHP-FPM monitoring enabled", always=True)
+        elif self.config.get('php_enabled'):
+            self.logger.warn("⚠️  PHP-FPM monitoring requested but unavailable")
 
         # Run both loops concurrently
         await asyncio.gather(
@@ -181,6 +208,21 @@ class CliPalAgent:
                                 self.logger.info(f"Collected {len(query_stats)} query stats", always=True)
             except Exception as e:
                 self.logger.error(f"Error collecting database metrics: {e}")
+
+        # Add PHP-FPM metrics if available
+        if self.php_monitor:
+            try:
+                php_metrics = self.php_monitor.collect_metrics()
+                if php_metrics and php_metrics.get('pools'):
+                    metrics['php_status'] = php_metrics
+
+                # Collect slow traces (tails slowlog files)
+                slow_traces = self.php_monitor.collect_slow_traces()
+                if slow_traces:
+                    metrics['php_slow_traces'] = slow_traces
+                    self.logger.info(f"Collected {len(slow_traces)} PHP slow traces", always=True)
+            except Exception as e:
+                self.logger.error(f"Error collecting PHP metrics: {e}")
 
         # Send via REST API
         await self._send_in_executor(self.api_client.send_metrics, metrics)
