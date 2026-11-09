@@ -8,6 +8,7 @@ Collects metrics, query stats, EXPLAIN plans, and deadlock detection.
 import re
 import json
 import hashlib
+from collections import OrderedDict
 from datetime import datetime
 from typing import Optional, Set, Tuple
 
@@ -27,6 +28,11 @@ class MySQLMonitor(DatabaseMonitor):
     Phase 2: Collects query stats from performance_schema
     Phase 3: Deadlock detection and parsing
     """
+
+    # Undelivered deadlocks kept for retry; the oldest is dropped beyond this
+    MAX_PENDING_DEADLOCKS = 10
+    # Consecutive SHOW ENGINE INNODB STATUS failures before giving up until the next deadlock
+    MAX_DEADLOCK_CHECK_FAILURES = 3
 
     def __init__(self, host: str = 'localhost', port: int = 3306,
                  user: str = None, password: str = None,
@@ -54,8 +60,12 @@ class MySQLMonitor(DatabaseMonitor):
         self.metrics_count = 0
 
         # Deadlock tracking (Phase 3)
-        self.last_deadlock_count = None
-        self.last_deadlock_hash = None
+        self.last_deadlock_count = None   # Innodb_deadlocks baseline (None = take a new one)
+        self.last_uptime = None           # Uptime at the baseline, to spot restarts
+        self.last_deadlock_hash = None    # Last deadlock section the server accepted
+        self._deadlock_check_due = False  # SHOW ENGINE INNODB STATUS still needs reading
+        self._deadlock_check_failures = 0
+        self._pending_deadlocks = OrderedDict()  # section_hash -> info, awaiting delivery
 
         if not MYSQL_AVAILABLE:
             self.logger.warn("mysql-connector-python not installed")
@@ -92,14 +102,18 @@ class MySQLMonitor(DatabaseMonitor):
     def get_metrics(self) -> dict:
         """Collect MySQL metrics
 
+        Deadlocks are not included: they are queued for delivery, see
+        get_pending_deadlocks().
+
         Returns:
-            dict with basic metrics, status, variables (if changed), and deadlock info
+            dict with basic metrics, status and variables (if changed)
         """
         if not self.enabled:
             return {}
 
         metrics = {}
         conn = None
+        deadlock_checked = False
 
         try:
             conn = self._connect()
@@ -113,6 +127,13 @@ class MySQLMonitor(DatabaseMonitor):
             status_rows = cursor.fetchall()
             status = {row['Variable_name']: row['Value'] for row in status_rows}
             metrics['status'] = status
+
+            # Check for deadlocks first, so a failure in the queries below can't skip it
+            try:
+                self.check_for_deadlock(status)
+            except Exception as e:
+                self.logger.error(f"Error checking for deadlocks: {e}")
+            deadlock_checked = True
 
             # Extract key metrics
             metrics['mysql_version'] = status.get('Version', 'unknown')
@@ -182,19 +203,14 @@ class MySQLMonitor(DatabaseMonitor):
             cursor.close()
             self.logger.debug(f"Collected metrics: {len(metrics)} items + full status ({len(status)} vars)")
 
-            # Check for deadlocks
-            try:
-                deadlock_info = self.check_for_deadlock(status)
-                if deadlock_info:
-                    metrics['deadlock'] = deadlock_info
-            except Exception as e:
-                self.logger.error(f"Error checking for deadlocks: {e}")
-
         except mysql.connector.Error as e:
             self.logger.error(f"MySQL error: {e.msg} (Error {e.errno})")
         except Exception as e:
             self.logger.error(f"Error collecting MySQL metrics: {type(e).__name__}: {e}")
         finally:
+            if not deadlock_checked:
+                # Couldn't read the counter (MySQL down or connection lost)
+                self._reset_deadlock_baseline()
             if conn and conn.is_connected():
                 conn.close()
 
@@ -573,61 +589,133 @@ class MySQLMonitor(DatabaseMonitor):
         return schema_info
 
     def check_for_deadlock(self, current_status: dict) -> Optional[dict]:
-        """Check if a new deadlock occurred
+        """Check if a deadlock occurred since the previous sample
+
+        Innodb_deadlocks is cumulative and drops to 0 when MySQL/MariaDB restarts,
+        while the agent keeps running. A counter or Uptime that went down is treated
+        as a reset: take a new baseline and, if the counter is already > 0, read
+        SHOW ENGINE INNODB STATUS for a deadlock we may not have reported. The first
+        sample after agent start or after a lost connection does the same. Repeats
+        are filtered by section hash, here and server-side.
+
+        New deadlocks are queued rather than returned for sending: the caller sends
+        get_pending_deadlocks() and calls mark_deadlock_reported() once the server
+        accepts one, so a failed POST is retried next cycle.
 
         Args:
             current_status: Dict from SHOW GLOBAL STATUS
 
         Returns:
-            Parsed deadlock info dict if new deadlock detected, None otherwise
+            Deadlock info dict queued by this call, or None
         """
-        current_count = int(current_status.get('Innodb_deadlocks', 0))
-
-        if self.last_deadlock_count is None:
-            self.last_deadlock_count = current_count
-            self.logger.debug(f"Deadlock monitoring initialized (baseline: {current_count})")
+        current_count = self._status_int(current_status, 'Innodb_deadlocks')
+        if current_count is None:
             return None
+        current_uptime = self._status_int(current_status, 'Uptime')
 
-        if current_count <= self.last_deadlock_count:
-            return None
-
-        deadlocks_since_last = current_count - self.last_deadlock_count
-        self.logger.warn(f"Deadlock detected! Counter: {self.last_deadlock_count} -> {current_count}")
+        previous_count = self.last_deadlock_count
+        previous_uptime = self.last_uptime
         self.last_deadlock_count = current_count
+        self.last_uptime = current_uptime
 
-        return self._get_deadlock_info()
+        if previous_count is None:
+            self.logger.debug(f"Deadlock monitoring baseline: {current_count}")
+            if current_count > 0:
+                self._deadlock_check_due = True
+        elif current_count < previous_count or (
+                current_uptime is not None and previous_uptime is not None
+                and current_uptime < previous_uptime):
+            self.logger.warn(
+                f"Innodb_deadlocks reset ({previous_count} -> {current_count}, uptime "
+                f"{previous_uptime}s -> {current_uptime}s): MySQL restarted, new baseline"
+            )
+            if current_count > 0:
+                self._deadlock_check_due = True
+        elif current_count > previous_count:
+            self.logger.warn(f"Deadlock detected! Counter: {previous_count} -> {current_count}")
+            self._deadlock_check_due = True
 
-    def _get_deadlock_info(self) -> Optional[dict]:
-        """Fetch and parse SHOW ENGINE INNODB STATUS for deadlock info
+        if not self._deadlock_check_due:
+            return None
+        return self._check_innodb_status_for_deadlock()
 
-        Returns:
-            Dict with parsed deadlock info, or None
+    def get_pending_deadlocks(self) -> list:
+        """Deadlocks detected but not yet accepted by the server, oldest first"""
+        return list(self._pending_deadlocks.values())
+
+    def mark_deadlock_reported(self, section_hash: str) -> None:
+        """Record that the server accepted this deadlock"""
+        self._pending_deadlocks.pop(section_hash, None)
+        self.last_deadlock_hash = section_hash
+
+    def _reset_deadlock_baseline(self) -> None:
+        """Forget the counter baseline after losing the connection
+
+        The server may have restarted meanwhile; the next successful sample takes
+        a new baseline and re-checks INNODB STATUS if the counter is > 0.
         """
+        self.last_deadlock_count = None
+        self.last_uptime = None
+
+    @staticmethod
+    def _status_int(status: dict, name: str) -> Optional[int]:
+        try:
+            return int(status[name])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _check_innodb_status_for_deadlock(self) -> Optional[dict]:
+        """Read the latest deadlock from INNODB STATUS and queue it if it is new
+
+        If the read fails, the check is retried next cycle, up to
+        MAX_DEADLOCK_CHECK_FAILURES times in a row.
+        """
+        try:
+            innodb_status = self._fetch_innodb_status()
+        except Exception as e:
+            self._deadlock_check_failures += 1
+            if self._deadlock_check_failures >= self.MAX_DEADLOCK_CHECK_FAILURES:
+                self.logger.error(
+                    f"Error fetching INNODB STATUS: {e} - giving up after "
+                    f"{self._deadlock_check_failures} attempts until the next deadlock"
+                )
+                self._deadlock_check_due = False
+                self._deadlock_check_failures = 0
+            else:
+                self.logger.error(f"Error fetching INNODB STATUS: {e} (will retry next cycle)")
+            return None
+
+        self._deadlock_check_due = False
+        self._deadlock_check_failures = 0
+
+        if not innodb_status:
+            return None
+
+        deadlock_info = self._parse_deadlock_section(innodb_status)
+        if not deadlock_info:
+            return None
+
+        self._pending_deadlocks[deadlock_info['section_hash']] = deadlock_info
+        while len(self._pending_deadlocks) > self.MAX_PENDING_DEADLOCKS:
+            dropped_hash, _ = self._pending_deadlocks.popitem(last=False)
+            self.logger.error(f"Dropping undelivered deadlock {dropped_hash} (too many pending)")
+
+        return deadlock_info
+
+    def _fetch_innodb_status(self) -> str:
+        """Return the SHOW ENGINE INNODB STATUS text; raises if it can't be read"""
         conn = self._connect()
         if not conn:
-            return None
+            raise ConnectionError("could not connect to MySQL")
 
         try:
             cursor = conn.cursor(dictionary=True)
             cursor.execute("SHOW ENGINE INNODB STATUS")
             result = cursor.fetchone()
             cursor.close()
+            return (result or {}).get('Status') or ''
+        finally:
             conn.close()
-
-            if not result:
-                return None
-
-            raw_status = result.get('Status', '')
-            if not raw_status:
-                return None
-
-            return self._parse_deadlock_section(raw_status)
-
-        except Exception as e:
-            self.logger.error(f"Error fetching INNODB STATUS: {e}")
-            if conn and conn.is_connected():
-                conn.close()
-            return None
 
     def _parse_deadlock_section(self, innodb_status: str) -> Optional[dict]:
         """Parse the LATEST DETECTED DEADLOCK section from INNODB STATUS
@@ -649,12 +737,12 @@ class MySQLMonitor(DatabaseMonitor):
             self.logger.info("No LATEST DETECTED DEADLOCK section found in INNODB STATUS", always=True)
             return None
 
-        # Dedupe check - hash the raw section to avoid re-sending same deadlock
+        # Dedupe check - hash the raw section to avoid re-sending same deadlock.
+        # It only counts as reported once the server accepts it (mark_deadlock_reported).
         section_hash = hashlib.md5(deadlock_section.encode()).hexdigest()[:16]
-        if section_hash == self.last_deadlock_hash:
-            self.logger.info("Deadlock already reported (same hash), skipping duplicate", always=True)
+        if section_hash == self.last_deadlock_hash or section_hash in self._pending_deadlocks:
+            self.logger.info("Deadlock already reported or queued (same hash), skipping duplicate", always=True)
             return None
-        self.last_deadlock_hash = section_hash
 
         # Parse transactions
         transactions = self._parse_transactions(deadlock_section, parse_errors)

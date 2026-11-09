@@ -186,7 +186,7 @@ class CliPalAgent:
             try:
                 db_metrics = self.database_monitor.get_metrics()
                 if db_metrics:
-                    # Extract deadlock for separate handling
+                    # Monitors that still attach a single deadlock event (PostgreSQL)
                     deadlock_info = db_metrics.pop('deadlock', None)
                     metrics['mysql'] = db_metrics
 
@@ -209,6 +209,9 @@ class CliPalAgent:
             except Exception as e:
                 self.logger.error(f"Error collecting database metrics: {e}")
 
+            # Also runs when this cycle's DB collection failed, to retry earlier deadlocks
+            await self._flush_pending_deadlocks()
+
         # Add PHP-FPM metrics if available
         if self.php_monitor:
             try:
@@ -226,6 +229,27 @@ class CliPalAgent:
 
         # Send via REST API
         await self._send_in_executor(self.api_client.send_metrics, metrics)
+
+    async def _flush_pending_deadlocks(self):
+        """Send queued deadlocks, oldest first
+
+        A deadlock is marked as reported only after the server accepts it. On the
+        first failure the rest stay queued for the next cycle.
+        """
+        for deadlock_info in self.database_monitor.get_pending_deadlocks():
+            section_hash = deadlock_info.get('section_hash')
+            try:
+                sent = await self._send_in_executor(self.api_client.send_deadlock, deadlock_info)
+            except Exception as e:
+                self.logger.error(f"Error sending deadlock {section_hash}: {e}")
+                sent = False
+
+            if not sent:
+                self.logger.warn(f"Deadlock {section_hash} not delivered, will retry next cycle")
+                return
+
+            self.database_monitor.mark_deadlock_reported(section_hash)
+            self.logger.info(f"Deadlock {section_hash} reported", always=True)
 
     async def _collect_and_send_explains(self):
         """Collect EXPLAIN plans and schema, send via REST API"""

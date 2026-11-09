@@ -94,6 +94,14 @@ class DatabaseMonitor(ABC):
         # Default implementation - subclasses can override
         return None
 
+    def get_pending_deadlocks(self) -> list:
+        """Deadlocks detected but not yet accepted by the server, oldest first"""
+        return []
+
+    def mark_deadlock_reported(self, section_hash: str) -> None:
+        """Record that the server accepted the deadlock with this section_hash"""
+        pass
+
     def is_valid_query_for_optimization(self, query: str) -> Tuple[bool, str]:
         """Check if query is valid for optimization analysis
 
