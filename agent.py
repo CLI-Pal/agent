@@ -12,9 +12,13 @@ Features:
 """
 
 import sys
+import json
+import time
 import signal
 import asyncio
+import hashlib
 import argparse
+from typing import Optional
 
 # Local imports
 from lib.config import load_config, validate_secure_server
@@ -25,7 +29,7 @@ from lib.websocket_client import WebSocketClient
 from lib.terminal_handler import TerminalHandler
 from lib.database import create_database_monitor
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 # Optional PHP monitor (only loaded if enabled)
 def _create_php_monitor(config: dict, logger):
@@ -46,6 +50,85 @@ def _create_php_monitor(config: dict, logger):
     except Exception as e:
         logger.error(f"Failed to initialize PHP monitor: {e}")
         return None
+
+
+class SchemaUploadTracker:
+    """Remembers which table schemas the server has, so only changes are uploaded
+
+    Each table's columns and indexes are hashed, leaving out index cardinality
+    (an estimate that changes all the time). Tables matching the last successful
+    upload are skipped, except for a full upload on the first run and once a day.
+    """
+
+    FULL_UPLOAD_SECONDS = 24 * 3600
+    VOLATILE_FIELDS = ('CARDINALITY', 'cardinality')
+
+    def __init__(self):
+        self._uploaded = {}            # (schema, table) -> hash
+        self._last_full_upload = None  # time.monotonic() of the last full upload
+
+    def prepare(self, schema_info: dict, tables) -> Optional[dict]:
+        """Work out what to upload this cycle
+
+        Args:
+            schema_info: {'columns': [...], 'indexes': [...]} for the tables
+            tables: (schema, table) pairs the schema was collected for
+
+        Returns:
+            {'schema_info', 'tables', 'hashes', 'full'} for new or changed tables,
+            or None when there is nothing to upload
+        """
+        rows = {}
+        for kind in ('columns', 'indexes'):
+            for row in schema_info.get(kind) or []:
+                key = (self._field(row, 'TABLE_SCHEMA'), self._field(row, 'TABLE_NAME'))
+                rows.setdefault(key, {'columns': [], 'indexes': []})[kind].append(row)
+
+        full = (self._last_full_upload is None
+                or time.monotonic() - self._last_full_upload >= self.FULL_UPLOAD_SECONDS)
+
+        hashes = {}
+        for key in sorted(set(tables)):
+            table_rows = rows.get(key)
+            if not table_rows or not table_rows['columns']:
+                continue  # Dropped or not visible: nothing to replace it with
+            table_hash = self._hash(table_rows)
+            if full or self._uploaded.get(key) != table_hash:
+                hashes[key] = table_hash
+
+        if not hashes:
+            return None
+
+        return {
+            'schema_info': {
+                'indexes': [row for key in hashes for row in rows[key]['indexes']],
+                'columns': [row for key in hashes for row in rows[key]['columns']],
+            },
+            'tables': [[schema, table] for schema, table in hashes],
+            'hashes': hashes,
+            'full': full,
+        }
+
+    def mark_uploaded(self, upload: dict) -> None:
+        """Record a successful upload returned by prepare()"""
+        self._uploaded.update(upload['hashes'])
+        if upload['full']:
+            self._last_full_upload = time.monotonic()
+
+    @staticmethod
+    def _field(row: dict, name: str):
+        value = row.get(name, row.get(name.lower()))
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode('utf-8', errors='replace')
+        return value
+
+    def _hash(self, table_rows: dict) -> str:
+        parts = []
+        for kind in ('columns', 'indexes'):
+            for row in table_rows[kind]:
+                stable = {k: v for k, v in row.items() if k not in self.VOLATILE_FIELDS}
+                parts.append(kind + json.dumps(stable, sort_keys=True, default=str))
+        return hashlib.sha1('\n'.join(sorted(parts)).encode('utf-8')).hexdigest()
 
 
 class CliPalAgent:
@@ -96,6 +179,9 @@ class CliPalAgent:
         self.metrics_cycle_count = 0
         self.optimization_cycle_count = 0
         self.metrics_interval = 60  # seconds
+
+        # Schema already on the server, so unchanged tables aren't re-uploaded
+        self.schema_tracker = SchemaUploadTracker()
 
     async def run(self):
         """Main agent loop
@@ -271,18 +357,26 @@ class CliPalAgent:
             if success:
                 self.logger.info(f"Sent {len(explains)} EXPLAIN plans", always=True)
 
-            # Send schema for involved tables
+            # Send schema for involved tables that are new or changed
             if tables and self.api_client.instructions.get('collect_schema', True):
                 schema_info = self.database_monitor.get_targeted_schema_info(tables)
                 if schema_info:
-                    tables_list = [[s, t] for s, t in tables]
-                    success = await self._send_in_executor(
-                        self.api_client.send_schema_update,
-                        schema_info,
-                        tables_list
-                    )
-                    if success:
-                        self.logger.info(f"Sent schema for {len(tables)} tables", always=True)
+                    upload = self.schema_tracker.prepare(schema_info, tables)
+                    if not upload:
+                        self.logger.info(f"Schema unchanged for {len(tables)} tables, not uploading", always=True)
+                    else:
+                        success = await self._send_in_executor(
+                            self.api_client.send_schema_update,
+                            upload['schema_info'],
+                            upload['tables'],
+                            True
+                        )
+                        if success:
+                            self.schema_tracker.mark_uploaded(upload)
+                            self.logger.info(
+                                f"Sent schema for {len(upload['tables'])} of {len(tables)} tables",
+                                always=True
+                            )
 
     async def _send_in_executor(self, func, *args):
         """Run blocking function in executor

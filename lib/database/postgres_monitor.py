@@ -655,9 +655,12 @@ class PostgreSQLMonitor(DatabaseMonitor):
         except psycopg2.Error as e:
             if self.logger:
                 self.logger.error(f"Error collecting PostgreSQL schema: {e}")
+            # Never upload a partial schema: the server replaces tables with what it gets
+            schema_info = {}
         except Exception as e:
             if self.logger:
                 self.logger.error(f"Error collecting PostgreSQL schema: {type(e).__name__}: {e}")
+            schema_info = {}
         finally:
             cursor.close()
             conn.close()

@@ -582,6 +582,8 @@ class MySQLMonitor(DatabaseMonitor):
 
         except Exception as e:
             self.logger.error(f"Error collecting schema: {type(e).__name__}: {e}")
+            # Never upload a partial schema: the server replaces tables with what it gets
+            schema_info = {}
         finally:
             cursor.close()
             conn.close()
