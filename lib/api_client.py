@@ -2,7 +2,7 @@
 CLI Pal Agent - REST API Client Module
 
 Handles ONE-WAY communication: agent -> server via HTTP POST.
-Used for sending metrics, query stats, EXPLAIN plans, schema, and deadlocks.
+Used for sending metrics (with query stats), EXPLAIN plans, schema, and deadlocks.
 
 This is SEPARATE from WebSocket (which is for terminal sessions only).
 """
@@ -84,20 +84,6 @@ class MetricsAPIClient:
             True if the server stored them
         """
         return self._accepted(self._post('/api/v1/metrics', metrics))
-
-    def send_query_stats(self, query_stats: list) -> bool:
-        """POST query stats to /api/v1/query-stats
-
-        Args:
-            query_stats: List of query statistics
-
-        Returns:
-            True if successful
-        """
-        if not self.instructions.get('collect_query_stats', True):
-            self.logger.debug("Query stats collection disabled by server")
-            return True
-        return self._accepted(self._post('/api/v1/query-stats', {'query_stats': query_stats}))
 
     def send_query_explains(self, explains: list) -> bool:
         """POST EXPLAIN plans to /api/v1/query-explains
